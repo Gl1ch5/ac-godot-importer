@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+mods/
+out/
+out2/
+out3/
+out_amg/
+out_albert/
+*.glb
+*.zip
+*.rar
+*.7z
+.cache/
