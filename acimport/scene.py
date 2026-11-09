@@ -12,6 +12,7 @@ from __future__ import annotations
 import fnmatch
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -33,12 +34,18 @@ class Options:
 
 
 class MultiTextureCache:
-    """Декодирует текстуры из любого из kn5 и кэширует по имени."""
+    """Декодирует текстуры из любого из kn5 или с диска мода и кэширует по имени."""
 
-    def __init__(self, kn5s: list[K.Kn5]):
+    def __init__(self, kn5s: list[K.Kn5], mod_dir: Path | None = None):
         self.kn5s = kn5s
+        self.mod_dir = mod_dir
         self._img: dict[str, object] = {}
         self.errors: list[str] = []
+        self._disk_index: dict[str, Path] = {}
+        if mod_dir and Path(mod_dir).is_dir():
+            for p in Path(mod_dir).rglob("*"):
+                if p.is_file() and p.suffix.lower() in (".dds", ".png", ".jpg", ".jpeg"):
+                    self._disk_index.setdefault(p.name.lower(), p)
 
     def get(self, name: str | None):
         if not name:
@@ -56,6 +63,15 @@ class MultiTextureCache:
             except Exception as exc:
                 self.errors.append(f"{name}: {exc}")
             break
+
+        # если нет в kn5 — ищем на диске в папках мода (CSP extension, skins, etc.)
+        if img is None and key in self._disk_index:
+            try:
+                data = self._disk_index[key].read_bytes()
+                img = T.load_image(data)
+            except Exception as exc:
+                self.errors.append(f"{name} (on disk): {exc}")
+
         self._img[key] = img
         return img
 
@@ -115,7 +131,7 @@ def _node_world(root: K.Node, name: str) -> np.ndarray | None:
     return None
 
 
-def build_track(kn5s, builder: GL.GlbBuilder, opts: Options) -> dict:
+def build_track(kn5s, builder: GL.GlbBuilder, opts: Options, mod_dir: Path | None = None) -> dict:
     """Все kn5 трассы -> один GLB. Возвращает метаданные (спавны, поверхности).
 
     kn5s: список Kn5 либо пар (Kn5, доп. матрица из models.ini).
@@ -133,7 +149,7 @@ def build_track(kn5s, builder: GL.GlbBuilder, opts: Options) -> dict:
     root = builder.add_node("Track", matrix=np.eye(4))
     builder.add_root(root)
 
-    cache = MultiTextureCache(all_kn5)
+    cache = MultiTextureCache(all_kn5, mod_dir=mod_dir)
     # есть ли отдельный физический kn5 (physics*.kn5 / fisica*.kn5)
     physics_present = any(
         re.search(r"(physics|fisica|collision|surfaces)", kn5.path, re.I) for kn5 in all_kn5
@@ -184,6 +200,10 @@ def build_track(kn5s, builder: GL.GlbBuilder, opts: Options) -> dict:
         if merged is None:
             continue
         pos, nrm, uv, idx = merged
+        # Исправление нормалей для деревьев и травы (чтобы листва не была черной)
+        mat_shader = (material_of[name].shader or "").lower()
+        if "tree" in mat_shader or "tree" in name.lower() or "grass" in mat_shader:
+            nrm = G.fix_tree_normals(nrm)
         gm = M.convert(material_of[name], cache)
         mi = builder.add_material(gm, opts.max_texture)
         prim = GL.Primitive(
@@ -256,7 +276,7 @@ def _excluded(name: str, opts: Options) -> bool:
     return any(fnmatch.fnmatch(up, pat) for pat in CAR_EXCLUDE)
 
 
-def build_car(kn5: K.Kn5, builder: GL.GlbBuilder, opts: Options) -> dict:
+def build_car(kn5: K.Kn5, builder: GL.GlbBuilder, opts: Options, mod_dir: Path | None = None) -> dict:
     """KN5 машины -> GLB с поворотом 180° по Y и посадкой на y=0."""
     if kn5.root is None:
         raise ValueError("пустой KN5")
@@ -265,7 +285,7 @@ def build_car(kn5: K.Kn5, builder: GL.GlbBuilder, opts: Options) -> dict:
     builder.add_root(car)
 
     mat_cache: dict[str, int] = {}
-    cache = MultiTextureCache([kn5])
+    cache = MultiTextureCache([kn5], mod_dir=mod_dir)
     stats = {"nodes": 0, "meshes": 0, "skipped": [], "triangles": 0}
 
     def convert(node: K.Node, parent_idx: int) -> None:

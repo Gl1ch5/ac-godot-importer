@@ -132,20 +132,58 @@ def is_paint(name: str) -> bool:
     return any(h in low for h in PAINT_NAME_HINTS)
 
 
+CUTOUT_HINTS = (
+    "fence", "wire", "tree", "leaf", "leaves", "branch", "foliage", "bark",
+    "bush", "grass", "net", "chain", "grate", "grille", "mesh", "rail",
+    "canvas", "canopy", "stencil", "billboard", "flag", "banner", "crowd",
+    "hedge", "shrub", "plant", "fern", "ivy", "creeper", "straw", "guardrail",
+    "barrier", "brabham", "stand", "seat", "box", "building", "glass", "window"
+)
+
+
+def _is_cutout_candidate(mat_name: str, tex_name: str | None) -> bool:
+    s = (mat_name + " " + (tex_name or "")).lower()
+    return any(h in s for h in CUTOUT_HINTS)
+
+
+def _detect_alpha_cutout(img: Image.Image | None) -> bool:
+    """Определяет, есть ли в альфа-канале текстуры реальные вырезы (alpha < 128)."""
+    if img is None or img.mode not in ("RGBA", "LA"):
+        return False
+    try:
+        a = np.array(img.getchannel("A"))
+        # если есть хотя бы 0.5% пикселей с прозрачностью < 128 и есть непрозрачные пиксели
+        zeros = float(np.mean(a < 128))
+        return 0.005 < zeros < 0.99
+    except Exception:
+        return False
+
+
 def convert(material: K.Material, cache: TextureCache) -> GltfMaterial:
     shader = (material.shader or "").lower().replace("\\", "/").split("/")[-1]
     shader = shader.replace(".fx", "")
     alpha_tested = bool(material.alpha_tested)
     blend = material.blend_mode
-    is_tree = shader in ("kstree", "kstree_nodamage")
+    is_tree = shader in ("kstree", "kstree_nodamage") or "tree" in material.name.lower()
     is_glass = shader in ALPHA_SHADERS
 
     gm = GltfMaterial(name=material.name, is_paint=is_paint(material.name))
 
+    diffuse = cache.get(material.texture("txDiffuse"))
+    # Для ksMultilayer: в AC UV-сетка настроена под txDetailR (тайлинг травы/асфальта),
+    # а txDiffuse — это макро-подложка, для которой в glTF нет отдельных UV.
+    if "multilayer" in shader:
+        detail = cache.get(material.texture("txDetailR") or material.texture("txDetailG"))
+        if detail is not None:
+            diffuse = detail
+    tex_name = material.texture("txDiffuse")
+    is_cutout = _is_cutout_candidate(material.name, tex_name) and _detect_alpha_cutout(diffuse)
+
     # --- альфа ---
-    if is_tree or alpha_tested or blend == 2:
+    if is_tree or alpha_tested or blend == 2 or is_cutout:
         gm.alpha_mode = ALPHA_MODE_MASK
-        gm.alpha_cutoff = 0.4
+        gm.alpha_cutoff = 0.35
+        gm.double_sided = True
     elif blend == 1:
         gm.alpha_mode = ALPHA_MODE_BLEND
         gm.double_sided = False
@@ -156,7 +194,6 @@ def convert(material: K.Material, cache: TextureCache) -> GltfMaterial:
         gm.double_sided = True
 
     # --- базовый цвет ---
-    diffuse = cache.get(material.texture("txDiffuse"))
     if diffuse is not None:
         if gm.alpha_mode == ALPHA_MODE_OPAQUE and not is_glass:
             gm.base_color_texture = diffuse.convert("RGB")

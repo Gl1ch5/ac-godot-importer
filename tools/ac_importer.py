@@ -254,7 +254,7 @@ def import_car(mod: Path, car_id: str, out_root: Path, opts: SC.Options) -> dict
     print(f"[i] kn5 v{kn5.version}: {kn5.stats()}")
 
     builder = GL.GlbBuilder("ac_importer/car")
-    info = SC.build_car(kn5, builder, opts)
+    info = SC.build_car(kn5, builder, opts, mod_dir=mod)
 
     dest = out_root / "cars" / car_id
     dest.mkdir(parents=True, exist_ok=True)
@@ -298,7 +298,7 @@ def import_track(mod: Path, track_id: str, out_root: Path, opts: SC.Options, lay
         print(f"    kn5: {p.name} ({p.stat().st_size / 1e6:.1f} МБ) v{kn5.version}: {kn5.stats()}")
 
     builder = GL.GlbBuilder("ac_importer/track")
-    info = SC.build_track(kn5_entries, builder, opts)
+    info = SC.build_track(kn5_entries, builder, opts, mod_dir=mod)
 
     dest = out_root / "tracks" / track_id
     dest.mkdir(parents=True, exist_ok=True)
