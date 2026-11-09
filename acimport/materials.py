@@ -170,8 +170,8 @@ def convert(material: K.Material, cache: TextureCache) -> GltfMaterial:
     gm = GltfMaterial(name=material.name, is_paint=is_paint(material.name))
 
     diffuse = cache.get(material.texture("txDiffuse"))
-    # Для ksMultilayer: в AC UV-сетка настроена под txDetailR (тайлинг травы/асфальта),
-    # а txDiffuse — это макро-подложка, для которой в glTF нет отдельных UV.
+    # ksMultilayer: UV-сетка подогнана под тайлинг детальной текстуры (txDetailR),
+    # макро-подложка txDiffuse в glTF даёт плоскую «заливку».
     if "multilayer" in shader:
         detail = cache.get(material.texture("txDetailR") or material.texture("txDetailG"))
         if detail is not None:
@@ -194,6 +194,10 @@ def convert(material: K.Material, cache: TextureCache) -> GltfMaterial:
         gm.double_sided = True
 
     # --- базовый цвет ---
+    # AC умножает диффузную текстуру на ksDiffuse (у травы/асфальта он часто 0.2-0.3):
+    # без этого трасса в Godot выглядит «кислотной» и пересвеченной.
+    kd = float(np.clip(_prop_scalar(material, "ksDiffuse", 1.0), 0.05, 1.0))
+    gm.base_color_factor = (kd, kd, kd, 1.0)
     if diffuse is not None:
         if gm.alpha_mode == ALPHA_MODE_OPAQUE and not is_glass:
             gm.base_color_texture = diffuse.convert("RGB")
