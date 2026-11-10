@@ -25,6 +25,8 @@
 * 🚗 **`viper_srt.glb`** (7.7 МБ) — Dodge Viper GTS-R (ливрея #91, PBR, интерьер, колеса).
 * 🚗 **`mercedes_amg_gt2020.glb`** (60 МБ) — Mercedes-AMG GT 2020 (1.4M полигонов, скин-меши).
 * 🏁 **`albert_park_melbourne_2025.glb`** (224 МБ) — Полная трасса Формулы-1 с озером, парком, 367 сбатченными узлами и 766k полигонами коллизии.
+* 🏁 **`montreal_gp.glb`** (116 МБ) — Трасса Circuit Gilles Villeneuve (Монреаль, шикана, Стена чемпионов, PBR асфальт, коллизия).
+* 🏁 **`monza_2022.glb`** (154 МБ) — Автодром Autodromo Nazionale Monza 2022 (Curva Grande, Параболика, исторический бэнкинг, мульти-KN5).
 
 ---
 
