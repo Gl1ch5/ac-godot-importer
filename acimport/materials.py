@@ -240,12 +240,15 @@ def convert(material: K.Material, cache: TextureCache, is_track: bool = False) -
     is_decal = any(kw in material.name.lower() for kw in ("groove", "skid", "decal", "mark", "line", "rubber")) and "trees" not in material.name.lower()
     is_tree = (
         shader in ("kstree", "kstree_nodamage", "ksgrass")
-        or any(kw in material.name.lower() for kw in ("tree", "bush", "foliage", "pine", "hedge", "leaf", "leaves", "branch", "wood"))
+        or any(kw in material.name.lower() for kw in ("tree", "bush", "foliage", "pine", "hedge", "leaf", "leaves", "branch", "wood", "treeline", "treesline"))
     )
     if is_track:
         # Для трасс:
-        # 1. Деревья, растительность, сетки с вырезами — MASK (проверяем ПЕРЕД decal!)
-        if is_tree or alpha_tested or blend == 2 or shader.endswith("at") or shader.endswith("at_ns"):
+        if is_tree:
+            gm.alpha_mode = ALPHA_MODE_MASK
+            gm.alpha_cutoff = 0.5
+            gm.double_sided = True
+        elif alpha_tested or blend == 2 or shader.endswith("at") or shader.endswith("at_ns"):
             gm.alpha_mode = ALPHA_MODE_MASK
             ref = _prop_scalar(material, "ksAlphaRef", 0.35)
             gm.alpha_cutoff = float(np.clip(ref * 0.65, 0.12, 0.5))
@@ -312,12 +315,17 @@ def convert(material: K.Material, cache: TextureCache, is_track: bool = False) -
             gm.roughness_factor = float(np.clip(1.0 - spec, 0.08, 1.0))
 
     # --- нормали ---
-    # Для трасс: txNormalDetail (высокочастотный шум 30x тайлинга) в PBR без тайлинга дает дикий белый пересвет/блик!
-    nrm = cache.get(material.texture("txNormal"))
-    if nrm is not None:
-        gm.normal_texture = _flip_normal(nrm)
-    elif not is_track and cache.get(material.texture("txNormalDetail")) is not None:
-        gm.normal_texture = _flip_normal(cache.get(material.texture("txNormalDetail")))
+    # Для дорог и зон вылета на трассах отключаем Normal map, чтобы не было сиренево-голубого Z-fighting муара
+    if is_track and any(kw in material.name.lower() for kw in ("asph", "road", "track", "tarmac", "sand", "gravel", "runoff", "apsh", "top_b", "line", "groove")):
+        pass
+    else:
+        nrm = cache.get(material.texture("txNormal"))
+        if nrm is not None:
+            gm.normal_texture = _flip_normal(nrm)
+        elif not is_track:
+            nrm_det = cache.get(material.texture("txNormalDetail"))
+            if nrm_det is not None:
+                gm.normal_texture = _flip_normal(nrm_det)
 
     # --- эмиссия ---
     emis = cache.get(material.texture("txEmissive"))
