@@ -31,6 +31,8 @@ class Options:
     merge: bool = True
     quality: int = 90
     no_tangents: bool = False
+    drop_decals: bool = True
+    uv_max_density: float = 4.0   # макс. тайлов текстуры на метр (лечит «шум» бетона)
 
 
 class MultiTextureCache:
@@ -131,6 +133,25 @@ def _node_world(root: K.Node, name: str) -> np.ndarray | None:
     return None
 
 
+def _clamp_uv_density(uv: np.ndarray, pos: np.ndarray, max_density: float) -> np.ndarray:
+    """Ограничивает плотность UV: у AC бетон/гравий иногда тайлится 20-30 раз на метр,
+    после конвертации это даёт субпиксельный «телевизионный снег»."""
+    if max_density <= 0 or uv is None or len(uv) < 3:
+        return uv
+    duv = max(float(np.ptp(uv[:, 0])), float(np.ptp(uv[:, 1])))
+    dpos = max(float(np.ptp(pos[:, 0])), float(np.ptp(pos[:, 2])))
+    if dpos < 1e-6 or duv < 1e-6:
+        return uv
+    density = duv / dpos
+    if density <= max_density:
+        return uv
+    k = max_density / density
+    return (uv * k).astype(np.float32)
+
+
+DECAL_RX = re.compile(r"(groove|skid|crack|decal|stain|puddle|rubber)", re.I)
+
+
 def build_track(kn5s, builder: GL.GlbBuilder, opts: Options, mod_dir: Path | None = None) -> dict:
     """Все kn5 трассы -> один GLB. Возвращает метаданные (спавны, поверхности).
 
@@ -164,29 +185,47 @@ def build_track(kn5s, builder: GL.GlbBuilder, opts: Options, mod_dir: Path | Non
     for kn5, extra in entries:
         if kn5.root is None:
             continue
+        # физический kn5 целиком уходит в коллизию: иначе его кочки рисуются
+        # поверх визуальной сетки и дают z-fighting («серые ступеньки»).
+        is_physics_kn5 = bool(re.search(r"(physics|fisica|phy\b|collision)", kn5.path, re.I))
+        visited_nodes = set()
         for node, _path, world in K.iter_meshes(kn5.root):
-            if node.vertices is None or len(node.indices) < 3 or not node.active:
+            if node.indices is None or node.vertices is None or len(node.indices) < 3 or not node.active:
                 continue
+            node_id = (node.name, node.material, len(node.indices))
+            if node_id in visited_nodes:
+                continue
+            visited_nodes.add(node_id)
             info["source_meshes"] += 1
             mat = kn5.material_by_id(node.material)
             pos, nrm, uv, idx = G.bake(node, extra @ world)
+            # UV передаются 1:1 без модификации
             surf = surface_of(node.name)
 
-            # физическая сетка: явно невидимая или меш из physics-kn5 с именем поверхности
-            if (not node.renderable) or (physics_present and surf):
+            # Стандарт Kunos: если меш имеет префикс 1..9 (например, 1ROAD, 1KERB, 1GRASS, 1WALL)
+            # или это меш из физического kn5 — генерируем коллизию
+            is_kunos_phys = bool(re.match(r"^[1-9]+[A-Z_]+", node.name, re.I))
+            if is_physics_kn5 or (not node.renderable) or is_kunos_phys:
                 collision.setdefault(surf or "asphalt", []).append((pos, nrm, uv, idx))
-                if not node.renderable:
+                if is_physics_kn5 or (not node.renderable):
                     continue
-            elif not node.visible or mat is None:
+            if not node.visible or mat is None:
                 info["skipped"].append(node.name)
                 continue
-            else:
-                # физического kn5 в моде нет — коллизию строим по дорожным мешам
-                if surf in DRIVEABLE:
-                    collision.setdefault(surf, []).append((pos, nrm, uv, idx))
+            if not physics_present and surf in DRIVEABLE:
+                # физического kn5 нет — коллизию строим по дорожным мешам
+                collision.setdefault(surf, []).append((pos, nrm, uv, idx))
+
+            # Фильтрация только служебных маркеров по строгому списку
+            # AC_POBJECT_* (машины/пропсы/конусы) и меши 0*/1* остаются видимыми!
+            if re.match(r"^(AC_START_|AC_PIT_|AC_HOTLAP_START_|AC_TIME_|AC_AB_|AC_AUDIO_)", node.name, re.I):
+                info["skipped"].append(node.name)
+                continue
 
             visual.setdefault(mat.name, []).append((pos, nrm, uv, idx))
-            material_of[mat.name] = mat
+            # Умное слияние материалов: сохраняем материал с наибольшим числом текстурных слотов
+            if mat.name not in material_of or len(mat.mappings) > len(material_of[mat.name].mappings):
+                material_of[mat.name] = mat
 
         for special, key in (("AC_START_0", "start"), ("AC_PIT_0", "pit")):
             if info[key] is None:
@@ -204,7 +243,7 @@ def build_track(kn5s, builder: GL.GlbBuilder, opts: Options, mod_dir: Path | Non
         mat_shader = (material_of[name].shader or "").lower()
         if "tree" in mat_shader or "tree" in name.lower() or "grass" in mat_shader:
             nrm = G.fix_tree_normals(nrm)
-        gm = M.convert(material_of[name], cache)
+        gm = M.convert(material_of[name], cache, is_track=True)
         mi = builder.add_material(gm, opts.max_texture)
         prim = GL.Primitive(
             positions=pos.astype(np.float32),
@@ -243,6 +282,25 @@ def build_track(kn5s, builder: GL.GlbBuilder, opts: Options, mod_dir: Path | Non
             builder.nodes[col_idx].setdefault("children", []).append(ni)
             info["surfaces"][surf] = int(len(idx) // 3)
 
+    track_spec = {
+        "start_grid": {},
+        "pit_boxes": {},
+        "timing_gates": {},
+    }
+    for kn5, extra in entries:
+        if kn5.root is None:
+            continue
+        for n, p, w in K.iter_nodes(kn5.root):
+            world_m = extra @ w
+            pos = [round(float(v), 4) for v in world_m[:3, 3]]
+            if n.name.startswith("AC_START_"):
+                track_spec["start_grid"][n.name] = pos
+            elif n.name.startswith("AC_PIT_"):
+                track_spec["pit_boxes"][n.name] = pos
+            elif n.name.startswith("AC_TIME_"):
+                track_spec["timing_gates"][n.name] = pos
+
+    info["track_spec"] = track_spec
     info["texture_errors"] = cache.errors
     return info
 

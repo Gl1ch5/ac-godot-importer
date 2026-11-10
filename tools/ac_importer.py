@@ -125,12 +125,23 @@ def detect_kind(mod: Path) -> str:
     data = mod / "data"
     if (mod / "data.acd").exists() or (data / "car.ini").exists() or (data / "suspensions.ini").exists():
         return "car"
-    if (mod / "models.ini").exists() or list(mod.glob("models_*.ini")) or (mod / "ai" / "fast_lane.ai").exists():
+    if (mod / "models.ini").exists() or (mod / "data" / "surfaces.ini").exists() or list(mod.glob("models_*.ini")) or (mod / "ai" / "fast_lane.ai").exists():
         return "track"
-    if list(mod.glob("*.kn5")):
-        # грубая эвристика по именам файлов
-        names = {p.name.lower() for p in mod.glob("*.kn5")}
-        if any(k in n for n in names for k in ("track", "road", "circuit", "layout")):
+    kn5_files = list(mod.glob("*.kn5"))
+    if kn5_files:
+        # Инспекция узлов первого kn5
+        try:
+            sample = K.load(str(kn5_files[0]))
+            if sample.root is not None:
+                for n, p, w in K.iter_nodes(sample.root):
+                    if n.name in ("WHEEL_LF", "WHEEL_RF", "COCKPIT_HR", "STEER_HR"):
+                        return "car"
+                    if n.name.startswith("AC_START_") or re.match(r"^[1-9]+[A-Z_]+", n.name):
+                        return "track"
+        except Exception:
+            pass
+        names = {p.name.lower() for p in kn5_files}
+        if any(k in n for n in names for k in ("track", "road", "circuit", "layout", "phy")):
             return "track"
         if any("body" in n or "lod" in n for n in names):
             return "car"
@@ -363,6 +374,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="только JSON итога")
     ap.add_argument("--keep-temp", action="store_true", help="не удалять распакованное")
     ap.add_argument("--no-tangents", action="store_true", help="не писать TANGENT (Godot сгенерирует сам)")
+    ap.add_argument("--keep-decals", action="store_true", help="не выкидывать копланарные декали (накат, трещины)")
     args = ap.parse_args(argv)
 
     path = Path(args.path).expanduser()
@@ -372,7 +384,8 @@ def main(argv: list[str] | None = None) -> int:
 
     out_root = Path(args.out).expanduser()
     opts = SC.Options(max_texture=args.max_texture, keep_cockpit=args.keep_cockpit,
-                      keep_blur=args.keep_blur, no_tangents=args.no_tangents)
+                      keep_blur=args.keep_blur, no_tangents=args.no_tangents,
+                      drop_decals=not args.keep_decals)
 
     workdir = Path(tempfile.mkdtemp(prefix="ac_import_"))
     try:

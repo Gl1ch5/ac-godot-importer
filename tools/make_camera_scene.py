@@ -20,6 +20,28 @@ TEMPLATE = """extends Node3D
 var cameras = [
 {cams}]
 
+func _fix_textures(root: Node) -> void:
+	# Рантайм-загрузка GLB не генерирует мип-цепочку: без неё тайлящийся асфальт
+	# и сетки превращаются в «телевизионный снег». Строим мипы и включаем AF.
+	for mi in root.find_children("*", "MeshInstance3D", true, false):
+		var mesh: Mesh = mi.mesh
+		if mesh == null:
+			continue
+		for si in range(mesh.get_surface_count()):
+			var mat = mesh.surface_get_material(si)
+			if mat is StandardMaterial3D:
+				var m2: StandardMaterial3D = mat.duplicate()
+				m2.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS_ANISOTROPIC
+				for prop in ["albedo_texture", "normal_texture", "metallic_texture", "roughness_texture", "emission_texture"]:
+					var t = m2.get(prop)
+					if t is Texture2D:
+						var img: Image = t.get_image()
+						if img != null and img.get_width() > 1:
+							img.generate_mipmaps()
+							m2.set(prop, ImageTexture.create_from_image(img))
+				mesh.surface_set_material(si, m2)
+
+
 func _ready():
 	var env = WorldEnvironment.new()
 	var e = Environment.new()
@@ -35,7 +57,7 @@ func _ready():
 	e.sky = sky
 	e.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
 	e.ambient_light_sky_contribution = 0.6
-	e.ambient_light_energy = 0.65
+	e.ambient_light_energy = 0.55
 	e.tonemap_mode = Environment.TONE_MAPPER_ACES
 	e.tonemap_exposure = 0.95
 	env.environment = e
@@ -44,7 +66,7 @@ func _ready():
 	var sun = DirectionalLight3D.new()
 	sun.rotation_degrees = Vector3(-45, 45, 0)
 	sun.light_color = Color(1.0, 0.98, 0.95)
-	sun.light_energy = 1.15
+	sun.light_energy = 1.0
 	sun.shadow_enabled = true
 	sun.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
 	sun.directional_shadow_max_distance = 400.0
@@ -65,6 +87,7 @@ func _ready():
 		return
 	var model = gltf.generate_scene(state)
 	add_child(model)
+	_fix_textures(model)
 
 	var cam = Camera3D.new()
 	cam.far = 6000.0

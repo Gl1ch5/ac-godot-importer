@@ -110,12 +110,16 @@ def _flip_normal(img: Image.Image) -> Image.Image:
     return Image.fromarray(arr, "RGB")
 
 
-def _metallic_roughness(img: Image.Image) -> Image.Image:
+def _metallic_roughness(img: Image.Image, is_track: bool = False) -> Image.Image:
     """txMaps (R=spec, G=gloss, B=metal) -> glTF metallicRoughness (G=rough, B=metal)."""
     arr = np.array(img.convert("RGB"), dtype=np.uint8)
     out = np.empty_like(arr)
     out[:, :, 0] = 255                      # R не используется glTF; держим белым
-    out[:, :, 1] = 255 - arr[:, :, 1]       # G = 255 - gloss = roughness
+    rough = 255 - arr[:, :, 1]              # G = 255 - gloss = roughness
+    if is_track:
+        # Для трасс зажимаем минимальную шероховатость (мировые дороги не зеркалят скайбокс)
+        rough = np.clip(rough, 180, 255)
+    out[:, :, 1] = rough
     out[:, :, 2] = arr[:, :, 2]             # B = metal
     return Image.fromarray(out, "RGB")
 
@@ -125,6 +129,23 @@ def _has_alpha(img: Image.Image, threshold: int = 3) -> bool:
         return False
     a = np.array(img.getchannel("A"))
     return bool((a < 255 - threshold).any())
+
+
+def _blend_detail(macro: Image.Image, detail: Image.Image, size: int = 2048,
+                  strength: float = 0.35) -> Image.Image:
+    """Умножает макро-текстуру на детальную (как ksMultilayer в AC), но мягко.
+
+    Детальная карта AC — контрастный «умножающий» слой; при полной силе
+    полотно превращается в шум. Берём только deviation от среднего.
+    """
+    macro_rgb = macro.convert("RGB").resize((size, size), Image.LANCZOS)
+    det = detail.convert("L").resize((size, size), Image.LANCZOS)
+    a = np.asarray(macro_rgb, dtype=np.float32)
+    d = np.asarray(det, dtype=np.float32) / 255.0
+    mean = float(d.mean()) or 0.5
+    mod = 1.0 + strength * (d / mean - 1.0)
+    out = np.clip(a * mod[:, :, None], 0, 255).astype(np.uint8)
+    return Image.fromarray(out, "RGB")
 
 
 def is_paint(name: str) -> bool:
@@ -159,7 +180,7 @@ def _detect_alpha_cutout(img: Image.Image | None) -> bool:
         return False
 
 
-def convert(material: K.Material, cache: TextureCache) -> GltfMaterial:
+def convert(material: K.Material, cache: TextureCache, is_track: bool = False) -> GltfMaterial:
     shader = (material.shader or "").lower().replace("\\", "/").split("/")[-1]
     shader = shader.replace(".fx", "")
     alpha_tested = bool(material.alpha_tested)
@@ -170,36 +191,49 @@ def convert(material: K.Material, cache: TextureCache) -> GltfMaterial:
     gm = GltfMaterial(name=material.name, is_paint=is_paint(material.name))
 
     diffuse = cache.get(material.texture("txDiffuse"))
-    # ksMultilayer: UV-сетка подогнана под тайлинг детальной текстуры (txDetailR),
-    # макро-подложка txDiffuse в glTF даёт плоскую «заливку».
-    if "multilayer" in shader:
-        detail = cache.get(material.texture("txDetailR") or material.texture("txDetailG"))
-        if detail is not None:
-            diffuse = detail
-    tex_name = material.texture("txDiffuse")
-    is_cutout = _is_cutout_candidate(material.name, tex_name) and _detect_alpha_cutout(diffuse)
+
+    # Если это ksMultilayer и txDiffuse пуст или отсутствует — берем txDetailR или txDetailG
+    if "multilayer" in shader and diffuse is None:
+        diffuse = cache.get(material.texture("txDetailR") or material.texture("txDetailG"))
 
     # --- альфа ---
-    if is_tree or alpha_tested or blend == 2 or is_cutout:
-        gm.alpha_mode = ALPHA_MODE_MASK
-        gm.alpha_cutoff = 0.35
-        gm.double_sided = True
-    elif blend == 1:
-        gm.alpha_mode = ALPHA_MODE_BLEND
-        gm.double_sided = False
+    if is_track:
+        # Для трасс: в AC альфа-канал на непрозрачных шейдерах хранит спекуляр-маску
+        has_alpha_shader = "alpha" in shader or shader.endswith("at") or shader.endswith("at_ns")
+        if is_tree or alpha_tested or blend == 2 or (has_alpha_shader and blend == 0):
+            gm.alpha_mode = ALPHA_MODE_MASK
+            ref = _prop_scalar(material, "ksAlphaRef", 0.35)
+            gm.alpha_cutoff = float(np.clip(ref * 0.65, 0.12, 0.5))
+            gm.double_sided = True
+        elif blend == 1:
+            gm.alpha_mode = ALPHA_MODE_BLEND
+            gm.double_sided = False
+        else:
+            gm.alpha_mode = ALPHA_MODE_OPAQUE
     else:
-        gm.alpha_mode = ALPHA_MODE_OPAQUE
+        # Для машин: классический пайплайн — сохраняем альфа-режимы и спекуляр-маски авто
+        tex_name = material.texture("txDiffuse")
+        is_cutout = _is_cutout_candidate(material.name, tex_name) and _detect_alpha_cutout(diffuse)
+        if is_tree or alpha_tested or blend == 2 or is_cutout:
+            gm.alpha_mode = ALPHA_MODE_MASK
+            gm.alpha_cutoff = 0.4
+            gm.double_sided = True
+        elif blend == 1 or is_glass:
+            gm.alpha_mode = ALPHA_MODE_BLEND
+            gm.double_sided = False
+        else:
+            gm.alpha_mode = ALPHA_MODE_OPAQUE
 
     if is_tree:
         gm.double_sided = True
 
     # --- базовый цвет ---
-    # AC умножает диффузную текстуру на ksDiffuse (у травы/асфальта он часто 0.2-0.3):
-    # без этого трасса в Godot выглядит «кислотной» и пересвеченной.
-    kd = float(np.clip(_prop_scalar(material, "ksDiffuse", 1.0), 0.05, 1.0))
-    gm.base_color_factor = (kd, kd, kd, 1.0)
+    gm.base_color_factor = (1.0, 1.0, 1.0, 1.0)
     if diffuse is not None:
-        if gm.alpha_mode == ALPHA_MODE_OPAQUE and not is_glass:
+        if gm.alpha_mode == ALPHA_MODE_OPAQUE and is_track:
+            # Для трасс принудительно сбрасываем в RGB
+            gm.base_color_texture = diffuse.convert("RGB")
+        elif gm.alpha_mode == ALPHA_MODE_OPAQUE and not is_glass:
             gm.base_color_texture = diffuse.convert("RGB")
         else:
             gm.base_color_texture = diffuse.convert("RGBA")
@@ -207,12 +241,15 @@ def convert(material: K.Material, cache: TextureCache) -> GltfMaterial:
     # --- металл/шероховатость ---
     maps = cache.get(material.texture("txMaps"))
     if maps is not None:
-        gm.metallic_texture = _metallic_roughness(maps)
+        gm.metallic_texture = _metallic_roughness(maps, is_track=is_track)
         gm.metallic_factor = max(0.0, min(1.0, _prop_scalar(material, "ksSpecular", 1.0)))
     else:
         spec = _prop_scalar(material, "ksSpecular", 0.05)
         gm.metallic_factor = 0.0
-        gm.roughness_factor = float(np.clip(1.0 - spec, 0.08, 1.0))
+        if is_track:
+            gm.roughness_factor = float(np.clip(1.0 - spec, 0.85, 1.0))
+        else:
+            gm.roughness_factor = float(np.clip(1.0 - spec, 0.08, 1.0))
 
     # --- нормали ---
     nrm = cache.get(material.texture("txNormal"))

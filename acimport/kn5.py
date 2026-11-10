@@ -382,6 +382,16 @@ def transform_normals(m: np.ndarray, nrm: np.ndarray) -> np.ndarray:
     return out / ln
 
 
+def iter_nodes(root: Node, path: tuple[Node, ...] = ()):
+    """Обход всех узлов дерева: (узел, путь_включая_узел, мировая_матрица)."""
+    stack = [(root, path + (root,))]
+    while stack:
+        node, p = stack.pop()
+        yield node, p, world_matrix(list(p))
+        for c in reversed(node.children):
+            stack.append((c, p + (c,)))
+
+
 def iter_meshes(root: Node, path: tuple[Node, ...] = ()):
     """Обход дерева: (узел, путь_включая_узел, мировая_матрица)."""
     stack = [(root, path + (root,))]
