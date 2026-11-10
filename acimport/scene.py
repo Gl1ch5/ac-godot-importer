@@ -187,7 +187,8 @@ def build_track(kn5s, builder: GL.GlbBuilder, opts: Options, mod_dir: Path | Non
             continue
         # физический kn5 целиком уходит в коллизию: иначе его кочки рисуются
         # поверх визуальной сетки и дают z-fighting («серые ступеньки»).
-        is_physics_kn5 = bool(re.search(r"(physics|fisica|phy\b|collision)", kn5.path, re.I))
+        # 2_2022.kn5, physics, fisica и файлы с коллизией целиком уходят в физику!
+        is_physics_kn5 = bool(re.search(r"(physics|fisica|phy\b|collision|^[0-9]+_[0-9]+)", Path(kn5.path).name, re.I))
         visited_nodes = set()
         for node, _path, world in K.iter_meshes(kn5.root):
             if node.indices is None or node.vertices is None or len(node.indices) < 3 or not node.active:
@@ -199,16 +200,21 @@ def build_track(kn5s, builder: GL.GlbBuilder, opts: Options, mod_dir: Path | Non
             info["source_meshes"] += 1
             mat = kn5.material_by_id(node.material)
             pos, nrm, uv, idx = G.bake(node, extra @ world)
+            # Для декалей (groove, skid) сдвигаем вершины по нормали во избежание Z-fighting
+            if mat is not None and any(kw in mat.name.lower() for kw in ("groove", "skid", "decal", "rubber")) and "trees" not in mat.name.lower():
+                pos = pos + nrm * 0.005
             # UV передаются 1:1 без модификации
             surf = surface_of(node.name)
 
             # Стандарт Kunos: если меш имеет префикс 1..9 (например, 1ROAD, 1KERB, 1GRASS, 1WALL)
             # или это меш из физического kn5 — генерируем коллизию
             is_kunos_phys = bool(re.match(r"^[1-9]+[A-Z_]+", node.name, re.I))
-            if is_physics_kn5 or (not node.renderable) or is_kunos_phys:
+            if is_physics_kn5 or (not node.renderable):
                 collision.setdefault(surf or "asphalt", []).append((pos, nrm, uv, idx))
-                if is_physics_kn5 or (not node.renderable):
-                    continue
+                continue
+            elif is_kunos_phys:
+                collision.setdefault(surf or "asphalt", []).append((pos, nrm, uv, idx))
+                # Не пропускаем, если это не отдельный физический kn5
             if not node.visible or mat is None:
                 info["skipped"].append(node.name)
                 continue
@@ -216,10 +222,10 @@ def build_track(kn5s, builder: GL.GlbBuilder, opts: Options, mod_dir: Path | Non
                 # физического kn5 нет — коллизию строим по дорожным мешам
                 collision.setdefault(surf, []).append((pos, nrm, uv, idx))
 
-            # Фильтрация только служебных маркеров по строгому списку
-            # AC_POBJECT_* (машины/пропсы/конусы) и меши 0*/1* остаются видимыми!
-            if re.match(r"^(AC_START_|AC_PIT_|AC_HOTLAP_START_|AC_TIME_|AC_AB_|AC_AUDIO_)", node.name, re.I):
-                info["skipped"].append(node.name)
+            # декали (накат, трещины, пятна) лежат копланарно с полотном и после
+            # конвертации дают z-fighting — «телевизионный снег». По умолчанию убираем.
+            if opts.drop_decals and mat.blend_mode == 1 and DECAL_RX.search(mat.name):
+                info["skipped"].append(f"{node.name} ({mat.name})")
                 continue
 
             visual.setdefault(mat.name, []).append((pos, nrm, uv, idx))
@@ -241,7 +247,9 @@ def build_track(kn5s, builder: GL.GlbBuilder, opts: Options, mod_dir: Path | Non
         pos, nrm, uv, idx = merged
         # Исправление нормалей для деревьев и травы (чтобы листва не была черной)
         mat_shader = (material_of[name].shader or "").lower()
-        if "tree" in mat_shader or "tree" in name.lower() or "grass" in mat_shader:
+        mat_name_low = name.lower()
+        is_foliage = any(kw in mat_name_low for kw in ("tree", "bush", "foliage", "pine", "hedge", "leaf", "leaves", "grass", "branch", "wood", "bark")) or "tree" in mat_shader or "grass" in mat_shader
+        if is_foliage:
             nrm = G.fix_tree_normals(nrm)
         gm = M.convert(material_of[name], cache, is_track=True)
         mi = builder.add_material(gm, opts.max_texture)

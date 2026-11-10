@@ -131,21 +131,56 @@ def _has_alpha(img: Image.Image, threshold: int = 3) -> bool:
     return bool((a < 255 - threshold).any())
 
 
-def _blend_detail(macro: Image.Image, detail: Image.Image, size: int = 2048,
-                  strength: float = 0.35) -> Image.Image:
-    """Умножает макро-текстуру на детальную (как ksMultilayer в AC), но мягко.
+def _bake_multilayer_color(diffuse: Image.Image | None, mask: Image.Image | None,
+                           details: list[Image.Image | None], size: int = 1024) -> Image.Image | None:
+    """Для glTF: комбинирует macro txDiffuse и средние цвета txDetail по маске txMask."""
+    if diffuse is None:
+        # Если txDiffuse нет, берем первый непустой detail
+        for d in details:
+            if d is not None:
+                return d.convert("RGB")
+        return None
 
-    Детальная карта AC — контрастный «умножающий» слой; при полной силе
-    полотно превращается в шум. Берём только deviation от среднего.
-    """
-    macro_rgb = macro.convert("RGB").resize((size, size), Image.LANCZOS)
-    det = detail.convert("L").resize((size, size), Image.LANCZOS)
-    a = np.asarray(macro_rgb, dtype=np.float32)
-    d = np.asarray(det, dtype=np.float32) / 255.0
-    mean = float(d.mean()) or 0.5
-    mod = 1.0 + strength * (d / mean - 1.0)
-    out = np.clip(a * mod[:, :, None], 0, 255).astype(np.uint8)
-    return Image.fromarray(out, "RGB")
+    diff_rgb = diffuse.convert("RGB")
+    valid_details = [d for d in details if d is not None]
+    if not valid_details:
+        return diff_rgb
+
+    # Считаем средний RGB цвет для каждого слоя
+    means = []
+    for d in details:
+        if d is not None:
+            arr = np.asarray(d.convert("RGB"), dtype=np.float32) / 255.0
+            means.append(arr.mean(axis=(0, 1)))
+        else:
+            means.append(np.array([0.5, 0.5, 0.5], dtype=np.float32))
+
+    if mask is None:
+        # Усредняем по всем слоям
+        avg_mean = np.mean(means, axis=0)
+        diff_arr = np.asarray(diff_rgb, dtype=np.float32) / 255.0
+        baked = np.clip(diff_arr * avg_mean * 1.8 * 255.0, 0, 255).astype(np.uint8)
+        return Image.fromarray(baked, "RGB")
+
+    # С маской
+    m_img = mask.convert("RGBA").resize(diff_rgb.size, Image.Resampling.BILINEAR)
+    m_arr = np.asarray(m_img, dtype=np.float32) / 255.0
+    weights = m_arr[:, :, :4] # R, G, B, A
+    w_sum = weights.sum(axis=2, keepdims=True)
+    zero_mask = (w_sum < 0.01).squeeze(axis=2)
+    w_sum = np.maximum(w_sum, 0.001)
+    norm_w = weights / w_sum
+
+    # Комбинируем средние цвета деталей по пикселям маски
+    detail_col = np.zeros_like(norm_w[:, :, :3])
+    for ch in range(4):
+        detail_col += norm_w[:, :, ch:ch+1] * means[ch]
+    # Где маска нулевая — берем дефолтный серый оттенок деталей
+    detail_col[zero_mask] = np.mean(means, axis=0)
+
+    diff_arr = np.asarray(diff_rgb, dtype=np.float32) / 255.0
+    baked = np.clip(diff_arr * detail_col * 255.0, 0, 255).astype(np.uint8)
+    return Image.fromarray(baked, "RGB")
 
 
 def is_paint(name: str) -> bool:
@@ -192,20 +227,31 @@ def convert(material: K.Material, cache: TextureCache, is_track: bool = False) -
 
     diffuse = cache.get(material.texture("txDiffuse"))
 
-    # Если это ksMultilayer и txDiffuse пуст или отсутствует — берем txDetailR или txDetailG
-    if "multilayer" in shader and diffuse is None:
-        diffuse = cache.get(material.texture("txDetailR") or material.texture("txDetailG"))
+    # Если это ksMultilayer: запекаем цвета деталей с макро-текстурой
+    if "multilayer" in shader:
+        mask = cache.get(material.texture("txMask"))
+        det_r = cache.get(material.texture("txDetailR"))
+        det_g = cache.get(material.texture("txDetailG"))
+        det_b = cache.get(material.texture("txDetailB"))
+        det_a = cache.get(material.texture("txDetailA"))
+        diffuse = _bake_multilayer_color(diffuse, mask, [det_r, det_g, det_b, det_a])
 
     # --- альфа ---
+    is_decal = any(kw in material.name.lower() for kw in ("groove", "skid", "decal", "mark", "line", "rubber")) and "trees" not in material.name.lower()
+    is_tree = (
+        shader in ("kstree", "kstree_nodamage", "ksgrass")
+        or any(kw in material.name.lower() for kw in ("tree", "bush", "foliage", "pine", "hedge", "leaf", "leaves", "branch", "wood"))
+    )
     if is_track:
-        # Для трасс: в AC альфа-канал на непрозрачных шейдерах хранит спекуляр-маску
-        has_alpha_shader = "alpha" in shader or shader.endswith("at") or shader.endswith("at_ns")
-        if is_tree or alpha_tested or blend == 2 or (has_alpha_shader and blend == 0):
+        # Для трасс:
+        # 1. Деревья, растительность, сетки с вырезами — MASK (проверяем ПЕРЕД decal!)
+        if is_tree or alpha_tested or blend == 2 or shader.endswith("at") or shader.endswith("at_ns"):
             gm.alpha_mode = ALPHA_MODE_MASK
             ref = _prop_scalar(material, "ksAlphaRef", 0.35)
             gm.alpha_cutoff = float(np.clip(ref * 0.65, 0.12, 0.5))
             gm.double_sided = True
-        elif blend == 1:
+        # 2. Декали и накат — строго BLEND (не MASK!)
+        elif shader in ("ksperpixelalpha", "ksskidmarks", "kswindscreen", "ksclouds") or is_decal or blend == 1:
             gm.alpha_mode = ALPHA_MODE_BLEND
             gm.double_sided = False
         else:
@@ -228,7 +274,18 @@ def convert(material: K.Material, cache: TextureCache, is_track: bool = False) -
         gm.double_sided = True
 
     # --- базовый цвет ---
-    gm.base_color_factor = (1.0, 1.0, 1.0, 1.0)
+    if is_track and any(kw in material.name.lower() for kw in ("asph", "road", "track", "tarmac", "sand", "gravel", "runoff", "apsh", "top_b", "line")):
+        # Принудительно гасим отражение неба и пересвет на дорогах и зонах вылета
+        gm.base_color_factor = (0.55, 0.55, 0.55, 1.0)
+        gm.roughness_factor = 0.98
+        gm.metallic_factor = 0.0
+    elif is_track and is_decal:
+        # Для дорожных декалей (groove / skid) умножаем на темный коэффициент
+        gm.base_color_factor = (0.2, 0.2, 0.2, 1.0)
+        gm.roughness_factor = 0.98
+        gm.metallic_factor = 0.0
+    else:
+        gm.base_color_factor = (1.0, 1.0, 1.0, 1.0)
     if diffuse is not None:
         if gm.alpha_mode == ALPHA_MODE_OPAQUE and is_track:
             # Для трасс принудительно сбрасываем в RGB
@@ -240,22 +297,26 @@ def convert(material: K.Material, cache: TextureCache, is_track: bool = False) -
 
     # --- металл/шероховатость ---
     maps = cache.get(material.texture("txMaps"))
-    if maps is not None:
+    is_ground = is_track and any(kw in material.name.lower() for kw in ("asph", "road", "track", "tarmac", "sand", "gravel", "runoff", "apsh", "top_b", "grass"))
+    if maps is not None and not is_ground:
         gm.metallic_texture = _metallic_roughness(maps, is_track=is_track)
         gm.metallic_factor = max(0.0, min(1.0, _prop_scalar(material, "ksSpecular", 1.0)))
     else:
         spec = _prop_scalar(material, "ksSpecular", 0.05)
         gm.metallic_factor = 0.0
         if is_track:
-            gm.roughness_factor = float(np.clip(1.0 - spec, 0.85, 1.0))
+            # Для трасс зажимаем матовость и убираем спекуляр полностью
+            gm.roughness_factor = 0.98
+            gm.metallic_factor = 0.0
         else:
             gm.roughness_factor = float(np.clip(1.0 - spec, 0.08, 1.0))
 
     # --- нормали ---
+    # Для трасс: txNormalDetail (высокочастотный шум 30x тайлинга) в PBR без тайлинга дает дикий белый пересвет/блик!
     nrm = cache.get(material.texture("txNormal"))
     if nrm is not None:
         gm.normal_texture = _flip_normal(nrm)
-    elif cache.get(material.texture("txNormalDetail")) is not None:
+    elif not is_track and cache.get(material.texture("txNormalDetail")) is not None:
         gm.normal_texture = _flip_normal(cache.get(material.texture("txNormalDetail")))
 
     # --- эмиссия ---

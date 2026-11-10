@@ -83,14 +83,12 @@ def compute_tangents(pos: np.ndarray, nrm: np.ndarray, uv: np.ndarray, idx: np.n
     return np.concatenate([t, w[:, None]], axis=1).astype(np.float32)
 
 
-def fix_tree_normals(nrm: np.ndarray, up_weight: float = 0.75) -> np.ndarray:
-    """ksTree: N = normalize(lerp(N, up, 0.75)) — лечит чёрные деревья."""
+def fix_tree_normals(nrm: np.ndarray, up_weight: float = 1.0) -> np.ndarray:
+    """Для деревьев и растительности: нормали строго строго вверх (0, 1, 0)
+    чтобы обе плоскости креста освещались равномерно без черных половин."""
     up = np.zeros_like(nrm)
     up[:, 1] = 1.0
-    mixed = nrm * (1.0 - up_weight) + up * up_weight
-    ln = np.linalg.norm(mixed, axis=1, keepdims=True)
-    ln[ln < EPS] = 1.0
-    return mixed / ln
+    return up
 
 
 def merge_arrays(parts: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]):
